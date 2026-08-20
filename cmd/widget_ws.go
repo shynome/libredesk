@@ -18,6 +18,7 @@ import (
 
 const (
 	WidgetMsgTypeJoin      = "join"
+	WidgetMsgTypeRelay     = "inbox_relay"
 	WidgetMsgTypeTyping    = "typing"
 	WidgetMsgTypePing      = "ping"
 	WidgetMsgTypePong      = "pong"
@@ -49,6 +50,11 @@ type WidgetMessage struct {
 
 type WidgetInboxJoinRequest struct {
 	InboxID string `json:"inbox_id"`
+}
+
+type WidgetInboxRelayRequest struct {
+	InboxID string `json:"inbox_id"`
+	Secret  string `json:"secret"`
 }
 
 type WidgetTypingData struct {
@@ -131,6 +137,19 @@ func handleWidgetWS(r *fastglue.Request) error {
 			}
 
 			switch msg.Type {
+			case WidgetMsgTypeRelay:
+				joinedClient, joinedLiveChat, joinedInboxUUID, err := handleInboxRelay(app, sc, msg.Data, msg.Token, clientIP)
+				joinedUserID := 0
+				if err != nil {
+					app.lo.Error("error handling widget join", "error", err)
+					sendWidgetError(sc, "Failed to join conversation")
+					continue
+				}
+				client = joinedClient
+				liveChat = joinedLiveChat
+				inboxUUID = joinedInboxUUID
+				userID = joinedUserID
+
 			case WidgetMsgTypeJoin:
 				// Clean up previous client on re-join.
 				if client != nil && liveChat != nil {
@@ -187,6 +206,74 @@ func handleWidgetWS(r *fastglue.Request) error {
 		app.lo.Error("error upgrading widget websocket connection", "error", err)
 	}
 	return nil
+}
+
+func handleInboxRelay(app *App, sc *safeConn, data json.RawMessage, token, clientIP string) (*livechat.Client, *livechat.LiveChat, string, error) {
+	var joinData WidgetInboxRelayRequest
+	if err := json.Unmarshal(data, &joinData); err != nil {
+		return nil, nil, "", fmt.Errorf("invalid join data: %w", err)
+	}
+
+	inbox, err := app.inbox.GetDBRecord(joinData.InboxID)
+	if err != nil {
+		return nil, nil, "", fmt.Errorf("inbox not found: %w", err)
+	}
+	if !inbox.Enabled {
+		return nil, nil, "", fmt.Errorf("inbox is not enabled")
+	}
+
+	var config livechat.Config
+	if err := json.Unmarshal(inbox.Config, &config); err == nil {
+		if len(config.BlockedIPs) > 0 && httputil.IsIPBlocked(clientIP, config.BlockedIPs) {
+			return nil, nil, "", fmt.Errorf("IP address is blocked")
+		}
+	}
+
+	secret := inbox.Secret.String
+	if secret == "" || secret != joinData.Secret {
+		return nil, nil, "", fmt.Errorf("relay token validation failed: %w", err)
+	}
+
+	lcInbox, err := app.inbox.Get(inbox.ID)
+	if err != nil {
+		return nil, nil, "", fmt.Errorf("live chat inbox not found: %w", err)
+	}
+
+	liveChat, ok := lcInbox.(*livechat.LiveChat)
+	if !ok {
+		return nil, nil, "", fmt.Errorf("inbox is not a live chat inbox")
+	}
+
+	userIDStr := "*"
+	client, err := liveChat.AddClient(userIDStr)
+	if err != nil {
+		return nil, nil, "", fmt.Errorf("adding client to live chat: %w", err)
+	}
+
+	go func() {
+		defer func() {
+			if rec := recover(); rec != nil {
+				app.lo.Error("panic in widget ws forwarder", "panic", rec)
+			}
+		}()
+		for msgData := range client.Channel {
+			if err := sc.WriteMessage(websocket.TextMessage, msgData); err != nil {
+				app.lo.Error("error forwarding message to widget client", "error", err)
+				return
+			}
+		}
+	}()
+
+	if err := sc.WriteJSON(WidgetMessage{
+		Type: WidgetMsgTypeJoined,
+		Data: json.RawMessage(`{"message":"inbox relay!"}`),
+	}); err != nil {
+		return nil, nil, "", err
+	}
+
+	app.lo.Debug("widget client joined live chat", "user_id", userIDStr, "inbox_uuid", joinData.InboxID)
+
+	return client, liveChat, joinData.InboxID, nil
 }
 
 func handleInboxJoin(app *App, sc *safeConn, data json.RawMessage, token, clientIP string) (*livechat.Client, *livechat.LiveChat, string, int, error) {

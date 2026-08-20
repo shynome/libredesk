@@ -206,6 +206,9 @@ func (lc *LiveChat) Send(message models.OutboundMessage) error {
 		lc.lo.Debug("websocket client not connected for live chat message", "receiver_id", msgReceiverStr, "message_id", message.UUID)
 		return ErrClientNotConnected
 	}
+	if relays, exists := lc.clients["*"]; exists {
+		clients = append(clients, relays...)
+	}
 
 	sender, err := lc.userStore.GetAgent(message.SenderID, "")
 	if err != nil {
