@@ -242,6 +242,19 @@ func notAuthPage(handler fastglue.FastRequestHandler) fastglue.FastRequestHandle
 func rateLimit(handler fastglue.FastRequestHandler, ruleName string) fastglue.FastRequestHandler {
 	return func(r *fastglue.Request) error {
 		app := r.Context.(*App)
+		if secret := string(r.RequestCtx.Request.Header.Peek("X-Libredesk-Inbox-Secret")); secret != "" {
+			inboxUUID := string(r.RequestCtx.Request.Header.Peek(hdrWidgetInboxID))
+			if inboxUUID == "" {
+				return r.SendErrorEnvelope(fasthttp.StatusBadRequest, app.i18n.Ts("globals.messages.required", "name", "{globals.terms.inbox}"), nil, envelope.InputError)
+			}
+			inbox, err := app.inbox.GetDBRecord(inboxUUID)
+			if err != nil {
+				return err
+			}
+			if secret == inbox.Secret.String {
+				return handler(r)
+			}
+		}
 		if r.RequestCtx.UserValue(rateLimitPaidKey) != ruleName {
 			if err := app.rateLimit.Check(r.RequestCtx, ruleName); err != nil {
 				return err
